@@ -2,9 +2,9 @@ use crate::standard_library::StandardLibrary; // Standart kütüphaneyi kullanma
 
 pub struct ElbrusArchitecture<'a> {
     // Elbrus mimarisi için gerekli durumlar buraya eklenebilir:
-    // registers: ElbrusRegisters,
-    // memory: ElbrusMemory,
-    // pc: u64,
+     registers: ElbrusRegisters,
+     memory: ElbrusMemory,
+     pc: u64,
     standard_library: &'a StandardLibrary, // Standart kütüphaneye referans
 }
 
@@ -12,9 +12,9 @@ impl<'a> ElbrusArchitecture<'a> {
     pub fn new(standard_library: &'a StandardLibrary) -> Self {
         ElbrusArchitecture {
             // Registerları ve diğer durumları başlat
-            // registers: ElbrusRegisters::new(),
-            // memory: ElbrusMemory::new(),
-            // pc: 0,
+             registers: ElbrusRegisters::new(),
+             memory: ElbrusMemory::new(),
+             pc: 0,
             standard_library, // Standart kütüphane referansını al
         }
     }
