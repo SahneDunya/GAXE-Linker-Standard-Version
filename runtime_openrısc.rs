@@ -1,133 +1,213 @@
 use crate::arch_openrisc::OpenriscArchitecture;
-use crate::standard_library::StandardLibrary; // Standart kütüphaneyi içeri aktar
-use super::memory; // Sahne64 bellek yönetimini içeri aktar
-use super::SahneError; // Sahne64 hatalarını içeri aktar
-use std::fmt;
+use crate::arch_openrisc::OpenriscArchitectureError; // OpenRISC mimarisine özgü hata türü
 
-#[derive(Debug, fmt::Display)]
+// Sahne64 memory modülünü artık doğrudan runtime değil, Architecture kullanacak
+// use super::memory; // Kaldırıldı
+
+// Sahne64 hata türünü içeri aktar (Sahne64 API'sından dönebilir)
+use super::SahneError; // (varsa crate::SahneError olarak değiştirin)
+
+// Standard kütüphaneyi kullanmak için
+use crate::standard_library::StandardLibrary;
+
+// Diğer gerekli Rust core/alloc kütüphane elemanları
+use alloc::string::String;
+use alloc::format;
+use alloc::vec::Vec; // Often needed indirectly
+
+// Özel hata türü tanımlayın
+#[derive(Debug)] // fmt::Display de burada derive edilebilir
 pub enum OpenriscRuntimeError {
-    ExecutionError(String), // Genel yürütme hataları için
-    MemoryError(SahneError), // Sahne64 bellek hataları için
-    IOError(SahneError),     // Sahne64 I/O hataları için
-    // Gerekirse buraya daha özel hata türleri eklenebilir.
+     /// Çalışma zamanı başlatılırken Sahne64 kaynaklı bir hata oluştu.
+     InitializationError(SahneError), // MemoryError veya IOError yerine daha genel
+    /// VM belleğine kod yüklenirken hata oluştu.
+    CodeLoadError(String),
+    /// OpenRISC mimarisi yürütülürken bir hata oluştu.
+    ExecutionError(OpenriscArchitectureError), // String yerine OpenriscArchitectureError'ı kapsar
+    /// VM'in yürütme döngüsü beklenmedik şekilde sonlandı (örn. exit komutu olmadan).
+    UnexpectedTermination,
+    /// VM başarılı bir şekilde yürütmeyi tamamladı (örn. exit komutu ile), çıkış kodu ile birlikte.
+    ExecutionCompleted(i32), // Exit code
+    // OpenriscRuntimeError'ın orijinal varyantları (ExecutionError(String), MemoryError(SahneError), IOError(SahneError))
+    // artık OpenriscArchitectureError içinde veya InitializationError içinde detaylandırılmalıdır.
+     MemoryError(SahneError) -> InitializationError(SahneError) veya OpenriscArchitectureError::MemoryAccessError (eğer execution sırasında olursa)
+     IOError(SahneError) -> InitializationError(SahneError) veya OpenriscArchitectureError::SystemCallError (eğer syscall sırasında olursa)
+     ExecutionError(String) -> OpenriscArchitectureError::ExecutionError (daha genel mimari hata)
+    // Diğer mimariye özgü hatalar OpenriscArchitectureError'a taşınmalıdır.
 }
 
-impl From<SahneError> for OpenriscRuntimeError {
-    fn from(err: SahneError) -> Self {
-        match err {
-            SahneError::MemoryError(_) => OpenriscRuntimeError::MemoryError(err),
-            _ => OpenriscRuntimeError::IOError(err), // Diğer Sahne hatalarını I/O hatası olarak kabul edelim şimdilik
-        }
+// OpenriscArchitectureError'dan OpenriscRuntimeError::ExecutionError'a dönüşüm
+impl From<OpenriscArchitectureError> for OpenriscRuntimeError {
+    fn from(err: OpenriscArchitectureError) -> Self {
+        OpenriscRuntimeError::ExecutionError(err)
     }
 }
 
-impl std::error::Error for OpenriscRuntimeError {}
+// SahneError'dan OpenriscRuntimeError::InitializationError'a dönüşüm
+// OpenriscArchitecture::new veya runtime::new içindeki diğer Sahne64 çağrıları için.
+impl From<super::SahneError> for OpenriscRuntimeError { // use super::SahneError is assumed correct path
+    fn from(err: super::SahneError) -> Self {
+         // Orijinaldeki match yerine tüm SahneError'ları başlatma hatası olarak ele alalım.
+         // Yürütme sırasındaki SahneError'lar mimari tarafından yakalanıp OpenriscArchitectureError içine sarılmalıdır.
+        OpenriscRuntimeError::InitializationError(err)
+    }
+}
+
+impl std::error::Error for OpenriscRuntimeError {} // Implement Error trait
+
+impl std::fmt::Display for OpenriscRuntimeError { // Implement Display trait
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         match self {
+             OpenriscRuntimeError::InitializationError(e) => {
+                 write!(f, "OpenRISC çalışma zamanı başlatma hatası: {:?}", e)
+             }
+             OpenriscRuntimeError::CodeLoadError(msg) => {
+                 write!(f, "OpenRISC kod yükleme hatası: {}", msg)
+             }
+             OpenriscRuntimeError::ExecutionError(arch_error) => {
+                 write!(f, "OpenRISC yürütme hatası: {}", arch_error) // OpenriscArchitectureError'ın Display implementasyonunu kullanır
+             }
+             OpenriscRuntimeError::UnexpectedTermination => {
+                 write!(f, "OpenRISC yürütme beklenmedik şekilde sonlandı.")
+             }
+             OpenriscRuntimeError::ExecutionCompleted(code) => {
+                 write!(f, "OpenRISC yürütme başarıyla tamamlandı. Çıkış kodu: {}", code)
+             }
+         }
+     }
+}
+
 
 pub struct OpenriscRuntime {
     architecture: OpenriscArchitecture,
     standard_library: StandardLibrary, // Standart kütüphane örneği
-    memory_start: Option<*mut u8>,   // Sahne64 tarafından yönetilen bellek bloğunun başlangıcı
-    memory_size: usize,             // Yönetilen bellek bloğunun boyutu
-    // Çalışma zamanı durumu için diğer alanlar buraya eklenebilir, örneğin registerlar vb.
-    // registers: ...
 }
 
 impl OpenriscRuntime {
-    pub fn new() -> Self {
-        println!("OpenRISC Runtime başlatılıyor...");
-        OpenriscRuntime {
-            architecture: OpenriscArchitecture::new(),
-            standard_library: StandardLibrary::new(Architecture::OpenRISC), // Standart kütüphaneyi başlat
-            memory_start: None,
-            memory_size: 0,
-            // registers: ...
-        }
+    /// Yeni bir OpenriscRuntime örneği oluşturur ve VM belleğini tahsis eder.
+    ///
+    /// # Arguments
+    /// * `vm_memory_size` - VM için ayrılacak bellek boyutu.
+    /// * `standard_library` - VM tarafından kullanılacak StandardLibrary instance'ı.
+    ///
+    /// Sahne64 bellek tahsisi veya OpenriscArchitecture başlatma başarısız olursa `OpenriscRuntimeError` döner.
+    pub fn new(vm_memory_size: usize, standard_library: StandardLibrary) -> Result<Self, OpenriscRuntimeError> { // Return type changed
+         println!("OpenRISC Runtime başlatılıyor...");
+
+         // OpenriscArchitecture artık new fonksiyonında bellek tahsisini yapıyor.
+         // StandardLibrary'yi de OpenriscArchitecture'a geçirmeliyiz.
+        let architecture = OpenriscArchitecture::new(vm_memory_size, standard_library.clone())?; // OpenriscArchitecture::new Result<Self, SahneError> döner, From implementasyonu kullanılır. StandardLibrary clone edilebilir olmalı.
+
+         println!("OpenRISC Runtime başarıyla başlatıldı. Bellek boyutu: {} byte", architecture.vm_memory_size); // Boyutu architecture'dan al
+
+        Ok(OpenriscRuntime {
+             architecture,
+             standard_library, // StandardLibrary'nin bir kopyası architecture'da, asıl instance burada tutulur.
+        })
     }
 
-    // Sahne64 bellek yönetimini kullanarak bellek ayırma
-    pub fn initialize_memory(&mut self, size: usize) -> Result<(), OpenriscRuntimeError> {
-        match memory::allocate(size) {
-            Ok(ptr) => {
-                self.memory_start = Some(ptr);
-                self.memory_size = size;
-                println!("OpenRISC için {} byte bellek ayrıldı.", size);
-                Ok(())
-            }
-            Err(e) => Err(OpenriscRuntimeError::MemoryError(e)),
-        }
-    }
+    /// OpenRISC makine kodunu VM belleğine yükler ve yürütmeye başlar.
+    ///
+    /// # Arguments
+    /// * `code` - Yürütülecek makine kodu baytları.
+    ///
+    /// VM yürütme durumu veya hatası döndürür (çıkış kodu veya hata).
+    pub fn run(&mut self, code: &[u8]) -> Result<i32, OpenriscRuntimeError> { // Return type changed (i32 for exit code)
+        println!("OpenRISC kodu VM belleğine yüklemeye başlanıyor...");
 
-    // Belleğe yazma (örnek)
-    pub fn write_memory(&self, address: u32, data: &[u8]) -> Result<(), OpenriscRuntimeError> {
-        match self.memory_start {
-            Some(start) => {
-                if (address as usize) < self.memory_size && (address as usize + data.len()) <= self.memory_size {
-                    let ptr = unsafe { start.add(address as usize) };
-                    let dest = unsafe { core::slice::from_raw_parts_mut(ptr, data.len()) };
-                    dest.copy_from_slice(data);
-                    Ok(())
-                } else {
-                    Err(OpenriscRuntimeError::ExecutionError("Geçersiz bellek adresi veya boyutu.".to_string()))
-                }
-            }
-            None => Err(OpenriscRuntimeError::ExecutionError("Bellek henüz başlatılmadı.".to_string())),
-        }
-    }
-
-    // Bellekten okuma (örnek)
-    pub fn read_memory(&self, address: u32, size: usize) -> Result<&[u8], OpenriscRuntimeError> {
-        match self.memory_start {
-            Some(start) => {
-                if (address as usize) < self.memory_size && (address as usize + size) <= self.memory_size {
-                    let ptr = unsafe { start.add(address as usize) };
-                    let slice = unsafe { core::slice::from_raw_parts(ptr, size) };
-                    Ok(slice)
-                } else {
-                    Err(OpenriscRuntimeError::ExecutionError("Geçersiz bellek adresi veya boyutu.".to_string()))
-                }
-            }
-            None => Err(OpenriscRuntimeError::ExecutionError("Bellek henüz başlatılmadı.".to_string())),
-        }
-    }
-
-    pub fn run(&self, code: &[u8]) -> Result<(), OpenriscRuntimeError> {
-        println!("OpenRISC kod yürütmesi başlatılıyor. Kod boyutu: {} byte", code.len());
-
-        if code.is_empty() {
-            return Err(OpenriscRuntimeError::ExecutionError("Yürütülecek kod yok.".to_string()));
+        // Yürütülecek kodu VM belleğine yükle.
+        // OpenriscArchitecture içinde bellek erişim helperları olmalı (write_memory_slice).
+        let code_size = code.len();
+        if code_size > self.architecture.vm_memory_size {
+             // Kodu yüklemek için VM belleği yeterli değil.
+             eprintln!("Hata: Yüklenen kod VM belleğinden büyük (Kod boyutu: {}, Bellek boyutu: {})", code_size, self.architecture.vm_memory_size);
+             return Err(OpenriscRuntimeError::CodeLoadError(format!("Code size ({}) exceeds VM memory size ({})", code_size, self.architecture.vm_memory_size)));
         }
 
-        // **ÖNEMLİ:** OpenRISC mimarisinin çıktı (örneğin, konsola yazdırma) işlemleri nasıl ele alınacak?
-        // Genellikle bu, belirli bir bellek adresine yazarak veya bir sistem çağrısı yaparak gerçekleşir.
-        // Bu noktada, OpenriscArchitecture'ın bu işlemleri nasıl simüle ettiğini bilmemiz gerekiyor.
-
-        // **Örnek Yaklaşım:** Eğer OpenRISC kodu belirli bir adrese (örneğin, 0x80000000) bir string yazarsa,
-        // biz bu adresi kontrol edip StandardLibrary'yi kullanarak çıktıyı alabiliriz.
-
-        // **Daha Gelişmiş Yaklaşım:** OpenRISC için bir sistem çağrı mekanizması simüle edilebilir ve
-        // bu mekanizma Sahne64'ün sistem çağrılarına (örneğin, çıktı için fs::write) yönlendirilebilir.
-
-        // Şimdilik basit bir örnek olarak, kodun yürütülmesinin başarılı olduğunu varsayalım ve
-        // bir çıktı işlemi yapıldığında StandardLibrary'yi nasıl kullanabileceğimizi gösterelim.
-
-        // **Yer Tutucu: OpenRISC kodu tarafından bir çıktı stringi oluşturulduğunu varsayalım.**
-        let output_string = "OpenRISC uygulamasından merhaba!";
-
-        // Bu çıktıyı Sahne64'ün standart çıktısına yönlendirelim:
-        self.standard_library.print_string(output_string);
-
-        match self.architecture.execute_instruction(code) {
+        // Kodu VM belleğinin başlangıcına yaz.
+        // write_memory_slice 0 adresine yazmaya çalışacaktır.
+        match self.architecture.write_memory_slice(0, code) { // write_memory_slice should be in architecture
             Ok(_) => {
-                println!("OpenRISC kod yürütmesi başarıyla tamamlandı.");
-                Ok(())
+                println!("OpenRISC kodu VM belleğine başarıyla yüklendi ({} byte).", code_size);
+                // Program sayacını kodun başlangıcına ayarla (genellikle 0).
+                self.architecture.set_pc(0)?; // set_pc should be in architecture
             }
-            Err(arch_error) => {
-                let error_message = format!("OpenRISC mimari hatası: {}", arch_error);
-                eprintln!("HATA: {}", error_message);
-                Err(OpenriscRuntimeError::ExecutionError(error_message))
+             Err(e) => {
+                 // Belleğe yazma hatası (OpenriscArchitectureError)
+                  eprintln!("Hata: Kodu VM belleğine yazarken hata oluştu: {:?}", e); // e'nin Debug veya Display implementasyonu olmalı
+                  return Err(e.into()); // OpenriscArchitectureError -> RuntimeError::ExecutionError
+             }
+        }
+
+
+        println!("OpenRISC yürütme döngüsü başlatılıyor...");
+
+        // VM yürütme döngüsü
+        // execute_next_instruction PC'deki komutu yürütür, PC'yi ilerletir ve durumu günceller.
+        // Başarı döner veya bir hata (illegal instruction, bellek hatası, syscall vb.) döner.
+        // Exit syscall'u veya komutu özel olarak ele alınmalıdır (architecture tarafından sinyal verilir).
+
+        loop {
+            // OpenriscArchitecture::execute_instruction(code) çağrısı kaldırıldı.
+            // Yerine OpenriscArchitecture::execute_next_instruction() çağrılacak.
+            match self.architecture.execute_next_instruction() { // execute_next_instruction should be in architecture
+                Ok(execution_status) => { // execution_status VM'in devam edip etmeyeceğini veya exit kodunu belirtebilir.
+                    // Örnek: Eğer execute_next_instruction bir ExecutionStatus enum'ı dönüyorsa:
+                     match execution_status {
+                         ExecutionStatus::Continue => { /* Döngü devam etsin */ },
+                         ExecutionStatus::Exit(exit_code) => {
+                             println!("VM yürütme exit komutu ile sonlandı. Çıkış kodu: {}", exit_code);
+                             return Ok(exit_code); // Başarılı çıkış
+                         },
+                         ExecutionStatus::Breakpoint => {
+                              println!("VM breakpoint'e ulaştı.");
+                    //          // Hata ayıklayıcıya kontrolü devret veya hata dön.
+                              return Err(OpenriscRuntimeError::ExecutionError(OpenriscArchitectureError::ExecutionError("Breakpoint reached".to_string())));
+                         }
+                     }
+                     // Şimdilik, execute_next_instruction() sadece Result<()> dönüyor ve exit/breakpoint
+                     // hatalarını OpenriscArchitectureError olarak döndürüyor varsayalım (ARM runtime örneğindeki gibi).
+                     // Eğer Ok dönerse, döngü devam eder.
+
+                    // Eğer OpenriscArchitecture::execute_next_instruction'dan Ok dönüyorsa ve bu bir exit sinyali değilse...
+                    // Döngü devam eder.
+                }
+                // OpenriscArchitectureError içinden Exit veya Breakpoint gibi özel durumları yakala
+                 Err(OpenriscArchitectureError::ExecutionError(msg)) if msg.starts_with("Exit with code:") => {
+                    // execute_next_instruction exit durumunu özel bir ExecutionError mesajı ile bildiriyor varsayalım.
+                    // Gerçek implementasyonda daha temiz bir Enum varyantı kullanılır.
+                    let parts: Vec<&str> = msg.split(':').collect();
+                    if parts.len() == 2 {
+                        if let Ok(exit_code) = parts[1].trim().parse::<i32>() {
+                            println!("VM yürütme exit komutu ile sonlandı. Çıkış kodu: {}", exit_code);
+                            return Ok(exit_code); // Başarılı çıkış
+                        }
+                    }
+                    // Mesaj formatı yanlışsa hata
+                     eprintln!("Hata: Geçersiz exit mesajı formatı: {}", msg);
+                     return Err(OpenriscRuntimeError::ExecutionError(OpenriscArchitectureError::ExecutionError(format!("Invalid exit message format: {}", msg))));
+                }
+                Err(OpenriscArchitectureError::ExecutionError(msg)) if msg == "Breakpoint reached" => {
+                     println!("VM breakpoint'e ulaştı.");
+                     // Breakpoint durumunda dur ve bir hata olarak bildir.
+                     return Err(OpenriscRuntimeError::ExecutionError(OpenriscArchitectureError::ExecutionError("Breakpoint reached".to_string())));
+                }
+                 Err(e) => {
+                     // execute_next_instruction'dan dönen diğer hatalar (IllegalInstruction, MemoryAccessError, SystemCallError vb.)
+                     eprintln!("OpenRISC yürütme hatası: {:?}", e); // e'nin Debug veya Display implementasyonu olmalı
+                     return Err(e.into()); // OpenriscArchitectureError -> RuntimeError::ExecutionError
+                }
             }
         }
+
+        // Eğer döngü hiçbir zaman sonlanmazsa (exit/hata olmadan), buraya unreachable! eklenebilir
+        // veya bir timeout mekanizması olabilir.
+         Ok(0) // Bu satıra normalde erişilmemeli
     }
 
     // Diğer çalışma zamanı fonksiyonları eklenebilir.
+    // Örneğin: get_register, set_register, read_memory, write_memory gibi (architecture'dan çağrılarak)
+    // get_pc (architecture'dan)
+    // Syscall handling (architecture içinde)
+    // ...
 }
