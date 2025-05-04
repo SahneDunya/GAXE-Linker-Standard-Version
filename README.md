@@ -1,2 +1,9 @@
 # GAXE (Sahne Karnal default executable file)
 The standard executable file of Sahne Karnal architecture developed by Sahne Dünya is GAXE. If there is EXE in Windows or ELF in Unix, Sahne Karnal has GAXE. GAXE executable file offers multi-platform support and high performance, you do not need to use Sahne64 when developing software because GAXE can handle it alone, but Sahne64 is highly recommended for higher performance! There is no standard linker for GAXE executable file in the original open source version, as you know, executable files are actually files that store machine language 1 and 0 codes as a single piece, the compiler usually creates an .o object file after compiling a code, if you link it with a linker, you usually encounter thousands of options according to operating systems! So don't be surprised when you see files related to programming language or compiler here! These executable files support programming languages ​​D, C, C++ and Rust that are compatible with Sahne64. It is even compatible with both Mobile and PC.
+
+# Basic features
+1. In which area: User area
+2. Scene64 support: Yes
+3. Target source file: 151 MB
+4. Targeted Kernel: Sahne Karnal Mobile and Sahne Karnal PC
+5. Main programming language: Rust
