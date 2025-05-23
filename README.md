@@ -1,9 +1,2 @@
 # GAXE (Sahne Karnal default executable file)
-The standard executable file of Sahne Karnal architecture developed by Sahne Dünya is GAXE. If there is EXE in Windows or ELF in Unix, Sahne Karnal has GAXE. GAXE executable file offers multi-platform support and high performance, you do not need to use Sahne64 when developing software because GAXE can handle it alone, but Sahne64 is highly recommended for higher performance! There is no standard linker for GAXE executable file in the original open source version, as you know, executable files are actually files that store machine language 1 and 0 codes as a single piece, the compiler usually creates an .o object file after compiling a code, if you link it with a linker, you usually encounter thousands of options according to operating systems! So don't be surprised when you see files related to programming language or compiler here! These executable files support programming languages ​​D, C, C++ and Rust that are compatible with Sahne64. It is even compatible with both Mobile and PC.
-
-# Basic features
-1. In which area: User area
-2. Scene64 support: Yes
-3. Target source file: 151 MB
-4. Targeted Kernel: Sahne Karnal Mobile and Sahne Karnal PC
-5. Main programming language: Rust
+Gaxe is the standard executable file of Sahne Karnal architecture developed by Sahne Dünya. Gaxe format was developed for Sahne Karnal, an independent operating system project developed by Sahne Dünya, and this format, which is compatible with multiple operating systems thanks to being a 64-bit ELF derivative, is both open source and published under a free license. Gaxe Linker is a Linker created for this executable file. This linker is specifically designed for the Sahne Karnal Compiler compiler. If you ask why the Gaxe format is ELF-based, the Sahne Karnal independent operating system project is known for its efforts to be fully compatible with Unix, although it is not Unix-based. So it is normal that this format is based on this, but Sahne Karnal is not really a Unix! Detailed information about the Sahne Karnal Compiler compiler is described on another page, go there!
