@@ -1,291 +1,474 @@
-use crate::resource; // Kaynak yönetimi için
-use crate::memory as sahne_memory; // Bellek yönetimi için
-use crate::SahneError; // Sahne64 hata türü
-use crate::standard_library::StandardLibrary; // Standard kütüphaneye erişim için
+#![no_std]
 
-use core::ptr; // İşaretçi operasyonları için
-use alloc::vec::Vec; // Dinamik boyutlu string/data için
-use alloc::string::String; // String için
+use crate::error::{LinkerError, Result, ObjectParseError};
+use sahne64::utils::{String, Vec, HashMap, fmt}; // no_std uyumlu String, Vec, HashMap
 
+// ELF Sabitleri (Örnek - Genellikle tam bir kütüphane gerekir)
+// Bu değerler gerçek ELF spesifikasyonundan alınmıştır.
+// Kaynak: https://refspecs.linuxfoundation.org/elf/gabi-elf.html
 
-pub struct ArchitectureMips {
-    // Sahne64 tarafından yönetilen bellek için bir işaretçi ve boyutu
-    vm_memory_ptr: *mut u8,
-    vm_memory_size: usize,
+// e_ident (ELF Identifier) dizini offsetleri
+const EI_MAG0: usize = 0;   // File identification
+const EI_MAG1: usize = 1;   // File identification
+const EI_MAG2: usize = 2;   // File identification
+const EI_MAG3: usize = 3;   // File identification
+const EI_CLASS: usize = 4;  // File class (32-bit or 64-bit)
+const EI_DATA: usize = 5;   // Data encoding (endianness)
+const EI_VERSION: usize = 6; // ELF header version
+const EI_OSABI: usize = 7;  // OS/ABI identification
+const EI_ABIVERSION: usize = 8; // ABI version
+const EI_NIDENT: usize = 16; // Size of e_ident
 
-    // Program Sayacı (program counter)
-    program_counter: u32,
+// EI_CLASS değerleri
+const ELFCLASSNONE: u8 = 0;
+const ELFCLASS32: u8 = 1;
+const ELFCLASS64: u8 = 2; // 64-bit object
 
-    // Standard kütüphane instance'ı (VM içindeki guest code tarafından syscall'lar aracılığıyla kullanılır)
-    standard_library: StandardLibrary,
+// EI_DATA değerleri
+const ELFDATANONE: u8 = 0;
+const ELFDATA2LSB: u8 = 1; // Little-endian
+const ELFDATA2MSB: u8 = 2; // Big-endian
 
-    // ... diğer MIPS durumu (registerlar vb.) ...
+// e_type (Object File Type) değerleri
+const ET_NONE: u16 = 0;    // No file type
+const ET_REL: u16 = 1;     // Relocatable file (.o)
+const ET_EXEC: u16 = 2;    // Executable file
+const ET_DYN: u16 = 3;     // Shared object file
+const ET_CORE: u16 = 4;    // Core file
+
+// e_machine (Architecture) değerleri (Örnekler)
+// Bu değerler tüm mimarileri kapsamaz, sadece örneklerdir.
+const EM_NONE: u16 = 0;
+const EM_MIPS: u16 = 8;
+const EM_X86_64: u16 = 62; // AMD x86-64 architecture
+const EM_AARCH64: u16 = 183; // AArch64
+const EM_RISCV: u16 = 243; // RISC-V
+
+// Section Header Table Entry (Shdr) offsets (64-bit için)
+const SHDR_NAME: usize = 0; // sh_name
+const SHDR_TYPE: usize = 4; // sh_type
+const SHDR_FLAGS: usize = 8; // sh_flags
+const SHDR_ADDR: usize = 16; // sh_addr
+const SHDR_OFFSET: usize = 24; // sh_offset (dosya içindeki offset)
+const SHDR_SIZE: usize = 32; // sh_size (bölümün boyutu)
+const SHDR_LINK: usize = 40; // sh_link
+const SHDR_INFO: usize = 44; // sh_info
+const SHDR_ALIGN: usize = 48; // sh_addralign
+const SHDR_ENTSIZE: usize = 56; // sh_entsize
+const SHDR_ENTRY_SIZE: usize = 64; // Her bir bölüm başlığı girdisinin boyutu
+
+// Section Types (sh_type)
+const SHT_NULL: u32 = 0;          // Inactive
+const SHT_PROGBITS: u32 = 1;      // Program data
+const SHT_SYMTAB: u32 = 2;        // Symbol table
+const SHT_STRTAB: u32 = 3;        // String table
+const SHT_RELA: u32 = 4;          // Relocation entries with addends
+const SHT_HASH: u32 = 5;          // Symbol hash table
+const SHT_DYNAMIC: u32 = 6;       // Dynamic linking information
+const SHT_NOTE: u32 = 7;          // Notes
+const SHT_NOBITS: u32 = 8;        // Program space with no data (.bss)
+const SHT_REL: u32 = 9;           // Relocation entries, no addends
+const SHT_SHLIB: u32 = 10;        // Reserved
+const SHT_DYNSYM: u32 = 11;       // Dynamic linker symbol table
+
+// Symbol Table Entry (Sym) offsets (64-bit için)
+const SYM_NAME: usize = 0;   // st_name
+const SYM_INFO: usize = 4;   // st_info
+const SYM_OTHER: usize = 5;  // st_other
+const SYM_SHNDX: usize = 6;  // st_shndx (Section index)
+const SYM_VALUE: usize = 8;  // st_value
+const SYM_SIZE: usize = 16;  // st_size
+const SYM_ENTRY_SIZE: usize = 24; // Her bir sembol tablosu girdisinin boyutu
+
+// Relocation Entry (Rela) offsets (64-bit için)
+const RELA_OFFSET: usize = 0;   // r_offset
+const RELA_INFO: usize = 8;     // r_info (sembol ve tip)
+const RELA_ADDEND: usize = 16;  // r_addend
+const RELA_ENTRY_SIZE: usize = 24; // Her bir yeniden konumlandırma girdisinin boyutu
+
+// Yardımcı fonksiyon: Belirli bir offsetten belirli boyutta unsigned integer oku
+fn read_u64_le(data: &[u8], offset: usize) -> Result<u64> {
+    if data.len() < offset + 8 {
+        return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+            String::from_format_args!("{} adresinden 64-bit okuma hatası, veri boyutu yetersiz.", offset)
+        )));
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[offset..offset + 8]);
+    Ok(u64::from_le_bytes(bytes))
 }
 
-// Belleği serbest bırakmak için Drop trait'ini implemente et
-impl Drop for ArchitectureMips {
-    fn drop(&mut self) {
-        // Sahne64'ten allocate ile alınan belleği serbest bırak
-        if self.vm_memory_ptr.is_null() {
-             // Bellek hiç tahsis edilmemişse veya zaten serbest bırakılmışsa (memory.take() sonrası)
-             // Buraya düşmemeli, Drop sadece pointer valid iken çağrılır, ama emin olmak iyi.
-             return;
-        }
-        println!("MIPS VM belleği serbest bırakılıyor (Adres: {:p}, Boyut: {})...", self.vm_memory_ptr, self.vm_memory_size);
-        match sahne_memory::release(self.vm_memory_ptr, self.vm_memory_size) {
-            Ok(_) => println!("MIPS VM belleği başarıyla serbest bırakıldı."),
-            Err(e) => eprintln!("MIPS VM belleğini serbest bırakma hatası: {:?}", e),
-        }
-        // İşaretçiyi null yap ki Drop tekrar çağrılsa bile sorun olmasın (Drop'un birden çağrılması olası değil ama take() ile senkronize edilebilir)
-         self.vm_memory_ptr = ptr::null_mut(); // Drop'ta buna gerek yok normalde
-        self.vm_memory_size = 0;
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
+    if data.len() < offset + 4 {
+        return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+            String::from_format_args!("{} adresinden 32-bit okuma hatası, veri boyutu yetersiz.", offset)
+        )));
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&data[offset..offset + 4]);
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u16_le(data: &[u8], offset: usize) -> Result<u16> {
+    if data.len() < offset + 2 {
+        return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+            String::from_format_args!("{} adresinden 16-bit okuma hatası, veri boyutu yetersiz.", offset)
+        )));
+    }
+    let mut bytes = [0u8; 2];
+    bytes.copy_from_slice(&data[offset..offset + 2]);
+    Ok(u16::from_le_bytes(bytes))
+}
+
+/// ELF Section (Bölüm) yapısı.
+#[derive(Debug, Clone)]
+pub struct ElfSection {
+    pub name: String,        // Bölüm adı (örn: .text, .data)
+    pub section_type: u32,   // SHT_PROGBITS, SHT_SYMTAB vb.
+    pub flags: u64,          // SHF_ALLOC, SHF_EXECINSTR vb.
+    pub addr: u64,           // Bölümün sanal adresi (genellikle 0 .o dosyalarında)
+    pub offset: u64,         // Dosya içindeki offset
+    pub size: u64,           // Bölümün boyutu
+    pub link: u32,           // sh_link alanı (ilgili tablo dizini)
+    pub info: u32,           // sh_info alanı
+    pub addralign: u64,      // Hizalama gereksinimi
+    pub entsize: u64,        // Giriş boyutu (örn: sembol tablosu için)
+    pub data: Vec<u8>,       // Bölümün ham verisi
+    pub index: usize,        // Kendi dizini (shndx'e karşılık)
+}
+
+/// ELF Symbol (Sembol) yapısı.
+#[derive(Debug, Clone)]
+pub struct ElfSymbol {
+    pub name: String,        // Sembol adı
+    pub value: u64,          // Sembolün değeri (genellikle bölüm içi offset)
+    pub size: u64,           // Sembolün boyutu
+    pub info: u8,            // Sembol tipi ve bağlama (STB_LOCAL, STB_GLOBAL, STT_FUNC vb.)
+    pub other: u8,           // st_other alanı
+    pub shndx: u16,          // İlgili bölümün dizini (SHN_UNDEF, SHN_ABS, SHN_COMMON, section index)
+}
+
+impl ElfSymbol {
+    // Yardımcı fonksiyonlar: Sembol tipini ve bağlamayı çözmek için
+    pub fn bind(&self) -> u8 {
+        self.info >> 4
+    }
+    pub fn typ(&self) -> u8 {
+        self.info & 0x0F
     }
 }
 
+/// ELF Relocation (Yeniden Konumlandırma) yapısı (Rela tipi, yani addend'li).
+#[derive(Debug, Clone)]
+pub struct ElfRelocation {
+    pub offset: u64,      // Yeniden konumlandırma uygulanacak offset
+    pub info: u64,        // Sembol dizini ve relocation tipi
+    pub addend: i64,      // Ekleyic (addend)
+    pub symbol_index: u32, // Bilgilendirme: info'dan çıkarılan sembol dizini
+    pub typ: u32,          // Bilgilendirme: info'dan çıkarılan relocation tipi
+}
 
-impl ArchitectureMips {
-    /// Yeni bir `ArchitectureMips` örneği oluşturur ve bellek ayırır.
-    /// Bellek tahsisi başarısız olursa SahneError döner.
-    pub fn new(vm_memory_size: usize, standard_library: StandardLibrary) -> Result<Self, SahneError> {
-        println!("Sahne64 kullanarak {} byte MIPS VM belleği tahsis ediliyor...", vm_memory_size);
-        // Sahne64 memory modülünü kullanarak VM için bellek alanı tahsis et
-        let vm_memory_ptr = sahne_memory::allocate(vm_memory_size)?; // sahne_memory::allocate çağrısı, hata Result ile propagate edilir.
+impl ElfRelocation {
+    // info alanından sembol dizinini ve tipi çıkarma
+    pub fn r_sym(&self) -> u32 {
+        (self.info >> 32) as u32
+    }
+    pub fn r_type(&self) -> u32 {
+        self.info as u32
+    }
+}
 
-        println!("MIPS VM belleği tahsis edildi: {:p}", vm_memory_ptr);
+/// Ayrıştırılan bir object dosyasının temsilcisi.
+#[derive(Debug, Clone)]
+pub struct ObjectFile {
+    pub filename: String,
+    pub elf_header: ElfHeader,
+    pub sections: Vec<ElfSection>,
+    pub symbols: Vec<ElfSymbol>,
+    pub relocations: Vec<ElfRelocation>,
+    pub string_table_data: Vec<u8>, // .strtab'ın ham verisi
+    pub symbol_string_table_data: Vec<u8>, // .symtab'ın string tablosu
+    // Gelecekte eklenebilecek: dinamik bağlama bilgileri, mimariye özgü bayraklar
+}
 
-        Ok(ArchitectureMips {
-            vm_memory_ptr,
-            vm_memory_size,
-            program_counter: 0, // Başlangıç program sayacı (genellikle giriş noktası adresi)
-            standard_library,
-            // ... diğer MIPS durumlarını başlat ...
+/// ELF Header yapısı.
+#[derive(Debug, Clone)]
+pub struct ElfHeader {
+    pub ident: [u8; EI_NIDENT], // e_ident
+    pub typ: u16,               // e_type
+    pub machine: u16,           // e_machine
+    pub version: u32,           // e_version
+    pub entry: u64,             // e_entry (genellikle 0 for .o files)
+    pub phoff: u64,             // e_phoff (Program Header Table offset)
+    pub shoff: u64,             // e_shoff (Section Header Table offset)
+    pub flags: u32,             // e_flags
+    pub ehsize: u16,            // e_ehsize (ELF header size)
+    pub phentsize: u16,         // e_phentsize (Program Header entry size)
+    pub phnum: u16,             // e_phnum (Number of Program Header entries)
+    pub shentsize: u16,         // e_shentsize (Section Header entry size)
+    pub shnum: u16,             // e_shnum (Number of Section Header entries)
+    pub shstrndx: u16,          // e_shstrndx (Section header string table index)
+}
+
+/// Object dosyalarını ayrıştıran yapı.
+pub struct ObjectParser;
+
+impl ObjectParser {
+    pub fn new() -> Self {
+        ObjectParser
+    }
+
+    /// Ham bayt verisinden bir ELF object dosyasını ayrıştırır.
+    pub fn parse(&self, data: &[u8]) -> Result<ObjectFile> {
+        if data.len() < EI_NIDENT {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidFormat(
+                String::from_str("ELF kimliği için yeterli veri yok.")
+            )));
+        }
+
+        // 1. ELF Header'ı Ayrıştır (e_ident kısmı)
+        if data[EI_MAG0] != 0x7f || data[EI_MAG1] != b'E' || data[EI_MAG2] != b'L' || data[EI_MAG3] != b'F' {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidMagic));
+        }
+        if data[EI_CLASS] != ELFCLASS64 {
+            return Err(LinkerError::ObjectParse(ObjectParseError::UnsupportedArchitecture(
+                String::from_str("Sadece 64-bit ELF dosyaları desteklenmektedir.")
+            )));
+        }
+        if data[EI_DATA] != ELFDATA2LSB {
+            return Err(LinkerError::ObjectParse(ObjectParseError::UnsupportedEndianness(
+                String::from_str("Sadece Little-Endian ELF dosyaları desteklenmektedir.")
+            )));
+        }
+
+        let header_offset = EI_NIDENT; // e_ident'tan sonraki offset
+
+        let typ = read_u16_le(data, header_offset)?;
+        let machine = read_u16_le(data, header_offset + 2)?;
+        let version = read_u32_le(data, header_offset + 4)?;
+        let entry = read_u64_le(data, header_offset + 8)?;
+        let phoff = read_u64_le(data, header_offset + 16)?;
+        let shoff = read_u64_le(data, header_offset + 24)?;
+        let flags = read_u32_le(data, header_offset + 32)?;
+        let ehsize = read_u16_le(data, header_offset + 36)?;
+        let phentsize = read_u16_le(data, header_offset + 38)?;
+        let phnum = read_u16_le(data, header_offset + 40)?;
+        let shentsize = read_u16_le(data, header_offset + 42)?;
+        let shnum = read_u16_le(data, header_offset + 44)?;
+        let shstrndx = read_u16_le(data, header_offset + 46)?;
+
+        let elf_header = ElfHeader {
+            ident: {
+                let mut ident_arr = [0u8; EI_NIDENT];
+                ident_arr.copy_from_slice(&data[0..EI_NIDENT]);
+                ident_arr
+            },
+            typ,
+            machine,
+            version,
+            entry,
+            phoff,
+            shoff,
+            flags,
+            ehsize,
+            phentsize,
+            phnum,
+            shentsize,
+            shnum,
+            shstrndx,
+        };
+
+        if elf_header.typ != ET_REL {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidFileType(
+                String::from_str("Sadece relocatable (.o) dosyaları desteklenmektedir.")
+            )));
+        }
+        // Desteklenen mimariyi kontrol et (gelen machine kodu ile)
+        // Bu kısım, derleyicinizdeki TargetArch enum'undan gelen mimarilerle eşleşmelidir.
+        // Şimdilik sadece örnek olarak x86_64, AArch64, RISC-V, MIPS'i kontrol ediyoruz.
+        match elf_header.machine {
+            EM_X86_64 | EM_AARCH64 | EM_RISCV | EM_MIPS => { /* Destekleniyor */ }
+            _ => return Err(LinkerError::ObjectParse(ObjectParseError::UnsupportedArchitecture(
+                String::from_format_args!("Desteklenmeyen ELF mimarisi: {}", elf_header.machine)
+            ))),
+        }
+
+        // 2. Section Header Table'ı Ayrıştır
+        let mut sections: Vec<ElfSection> = Vec::new();
+        let shstrtab_data: Vec<u8>; // Bölüm isimleri string tablosu
+
+        if shnum == 0 {
+             return Err(LinkerError::ObjectParse(ObjectParseError::InvalidFormat(
+                String::from_str("ELF dosyası bölüm başlığı tablosu içermiyor.")
+            )));
+        }
+        if shstrndx as usize >= shnum as usize {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidFormat(
+                String::from_str("Geçersiz shstrndx değeri.")
+            )));
+        }
+
+        // Önce section header string table'ı bul ve oku
+        let shstrtab_shdr_offset = shoff as usize + (shstrndx as usize * shentsize as usize);
+        if data.len() < shstrtab_shdr_offset + shentsize as usize {
+             return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                String::from_str("Section Header String Table konumu geçersiz.")
+            )));
+        }
+        let shstrtab_offset = read_u64_le(data, shstrtab_shdr_offset + SHDR_OFFSET)?;
+        let shstrtab_size = read_u64_le(data, shstrtab_shdr_offset + SHDR_SIZE)?;
+        if data.len() < shstrtab_offset as usize + shstrtab_size as usize {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                String::from_str("Section Header String Table verisi geçersiz.")
+            )));
+        }
+        shstrtab_data = data[shstrtab_offset as usize .. (shstrtab_offset + shstrtab_size) as usize].to_vec();
+
+
+        for i in 0..shnum {
+            let shdr_start = shoff as usize + (i as usize * shentsize as usize);
+            if data.len() < shdr_start + shentsize as usize {
+                 return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                    String::from_format_args!("{} indeksli bölüm başlığı konumu geçersiz.", i)
+                )));
+            }
+
+            let name_offset = read_u32_le(data, shdr_start + SHDR_NAME)?;
+            let section_type = read_u32_le(data, shdr_start + SHDR_TYPE)?;
+            let flags = read_u64_le(data, shdr_start + SHDR_FLAGS)?;
+            let addr = read_u64_le(data, shdr_start + SHDR_ADDR)?;
+            let offset = read_u64_le(data, shdr_start + SHDR_OFFSET)?;
+            let size = read_u64_le(data, shdr_start + SHDR_SIZE)?;
+            let link = read_u32_le(data, shdr_start + SHDR_LINK)?;
+            let info = read_u32_le(data, shdr_start + SHDR_INFO)?;
+            let addralign = read_u64_le(data, shdr_start + SHDR_ALIGN)?;
+            let entsize = read_u64_le(data, shdr_start + SHDR_ENTSIZE)?;
+
+            let section_name = Self::read_string_from_bytes(&shstrtab_data, name_offset as usize)?;
+
+            let section_data_slice = if offset as usize + size as usize > data.len() || section_type == SHT_NOBITS {
+                // SHT_NOBITS (örn: .bss) bölümlerinin verisi diskte yer kaplamaz.
+                // Veya boyut/offset hatalıysa boş veri al.
+                &[]
+            } else {
+                &data[offset as usize .. (offset + size) as usize]
+            };
+
+            sections.push(ElfSection {
+                name: section_name,
+                section_type,
+                flags,
+                addr,
+                offset,
+                size,
+                link,
+                info,
+                addralign,
+                entsize,
+                data: section_data_slice.to_vec(),
+                index: i as usize,
+            });
+        }
+
+        // 3. Sembol Tablolarını ve Relocation Girişlerini Ayrıştır
+        let mut symbols: Vec<ElfSymbol> = Vec::new();
+        let mut relocations: Vec<ElfRelocation> = Vec::new();
+        let mut symbol_string_table_data: Vec<u8> = Vec::new(); // .symtab'ın kendi string tablosu (.strtab)
+
+        for section_idx in 0..sections.len() {
+            let section = &sections[section_idx];
+
+            match section.section_type {
+                SHT_SYMTAB | SHT_DYNSYM => {
+                    // Sembol tablosu bölümü (.symtab veya .dynsym)
+                    if section.link as usize >= sections.len() {
+                        return Err(LinkerError::ObjectParse(ObjectParseError::InvalidFormat(
+                            String::from_format_args!("Sembol tablosu ({}) için geçersiz sh_link (string tablosu dizini).", section.name)
+                        )));
+                    }
+                    symbol_string_table_data = sections[section.link as usize].data.clone();
+
+                    let num_symbols = section.size / section.entsize;
+                    for i in 0..num_symbols {
+                        let sym_start = (i * section.entsize) as usize;
+                        if section.data.len() < sym_start + SYM_ENTRY_SIZE {
+                            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                                String::from_str("Sembol tablosu girdisi yetersiz veri.")
+                            )));
+                        }
+
+                        let name_offset = read_u32_le(&section.data, sym_start + SYM_NAME)?;
+                        let info = section.data[sym_start + SYM_INFO];
+                        let other = section.data[sym_start + SYM_OTHER];
+                        let shndx = read_u16_le(&section.data, sym_start + SYM_SHNDX)?;
+                        let value = read_u64_le(&section.data, sym_start + SYM_VALUE)?;
+                        let size = read_u64_le(&section.data, sym_start + SYM_SIZE)?;
+
+                        let symbol_name = Self::read_string_from_bytes(&symbol_string_table_data, name_offset as usize)?;
+                        symbols.push(ElfSymbol {
+                            name: symbol_name,
+                            value,
+                            size,
+                            info,
+                            other,
+                            shndx,
+                        });
+                    }
+                },
+                SHT_RELA => {
+                    // Relocation tablosu (.rela.text, .rela.data vb.)
+                    let num_relocations = section.size / section.entsize;
+                    for i in 0..num_relocations {
+                        let rela_start = (i * section.entsize) as usize;
+                        if section.data.len() < rela_start + RELA_ENTRY_SIZE {
+                            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                                String::from_str("Relocation tablosu girdisi yetersiz veri.")
+                            )));
+                        }
+
+                        let offset = read_u64_le(&section.data, rela_start + RELA_OFFSET)?;
+                        let info = read_u64_le(&section.data, rela_start + RELA_INFO)?;
+                        let addend = i64::from_le_bytes(section.data[rela_start + RELA_ADDEND .. rela_start + RELA_ADDEND + 8].try_into().unwrap());
+
+                        relocations.push(ElfRelocation {
+                            offset,
+                            info,
+                            addend,
+                            symbol_index: (info >> 32) as u32, // Sembol dizinini info'dan çıkar
+                            typ: info as u32,                   // Relocation tipini info'dan çıkar
+                        });
+                    }
+                },
+                _ => { /* Diğer bölüm tipleri şimdilik atlanabilir */ }
+            }
+        }
+
+        Ok(ObjectFile {
+            filename: String::from_str("unknown.o"), // Gerçek isim dışarıdan verilmeli
+            elf_header,
+            sections,
+            symbols,
+            relocations,
+            string_table_data: shstrtab_data, // Genel string tablosu
+            symbol_string_table_data, // Sembol string tablosu
         })
     }
 
-     // Tahsis edilen bellek alanına güvenli erişim için yardımcı fonksiyon
-    fn get_memory_slice(&mut self) -> &mut [u8] {
-        // `unsafe` blok kullanımı işaretçi manipülasyonu içerdiği için gereklidir.
-        // VM'in pointer ve size alanlarının geçerli olduğu varsayılır.
-        // Drop sonrası çağrılmamalı.
-         if self.vm_memory_ptr.is_null() {
-             // Drop sonrası veya alloc hatası sonrası çağrılırsa panik olabilir,
-             // bu duruma göre hata yönetimi eklenmeli (örn: Result dönebilir bu fonskiyon da).
-             // Şimdilik basic panik bırakaalım.
-             panic!("Attempted to get memory slice from null pointer");
-         }
-        unsafe { core::slice::from_raw_parts_mut(self.vm_memory_ptr, self.vm_memory_size) }
-    }
-
-
-    /// MIPS komutunu yürütür.
-    ///
-    /// # Arguments
-    ///
-    /// * `instruction`: Yürütülecek komutun baytları.
-    ///
-    /// # Returns
-    ///
-    /// İşlemin sonucunu temsil eden bir `Result<(), &'static str>` döner.
-    /// SahneError'ları doğrudan bu fonksiyondan dönmek yerine, VM
-    /// kendi içinde yakalayıp VM'e özel bir hataya çevirebilir
-    /// veya task'ı sonlandırabilir. Şimdilik VM içi hatalar &'static str olarak kalıyor.
-    pub fn execute_instruction(&mut self, instruction: &[u8]) -> Result<(), &'static str> {
-        // Gerçek bir VM'de PC, komut fetch etmeden önce ilerletilir veya sonraki
-        // komutun adresi belirlenir. Basitlik için burada sonra ilerletiyoruz.
-         let current_pc = self.program_counter;
-         println!("MIPS komutu yürütülüyor (PC: 0x{:X}): {:?}", current_pc, instruction);
-
-
-        if instruction.is_empty() {
-             // PC ilerlemeden hata dön
-            return Err("Boş komut");
+    /// Bayt dizisinden null-terminated bir string okur.
+    fn read_string_from_bytes(data: &[u8], offset: usize) -> Result<String> {
+        let mut end = offset;
+        while end < data.len() && data[end] != 0 {
+            end += 1;
         }
-
-        // Komut uzunluğunu belirle (MIPS genellikle 4 byte'tır, ama bu örnek farklı olabilir)
-        // Bu örnekte komutun ilk byte'ının opcode, kalanının operand olduğunu varsayalım
-        // Gerçek MIPS'de bu çok daha karmaşıktır.
-        let instruction_len = instruction.len();
-        if instruction_len == 0 { return Err("Boş komut"); } // Zaten yukarıda kontrol edildi
-
-        let opcode = instruction[0];
-
-         // PC'yi sonraki komutun beklenen başlangıcına ilerlet (spekülatif)
-         // Branch/Jump komutları bu PC'yi daha sonra güncelleyecektir.
-         self.program_counter += instruction_len as u32;
-
-
-        // VM belleğine erişim için slice'ı alalım
-        // Bu slice, Sahne64 tarafından tahsis edilen bellek bloğudur.
-        let vm_memory = self.get_memory_slice();
-
-
-        match opcode {
-            // Örnek MIPS komutu: Belleğe yazma (örneğin, SW - Store Word gibi)
-            // Opcode 0x01, sonra 4 byte adres, sonra 4 byte değer varsayalım
-            0x01 => {
-                println!("  - Opcode 0x01: Örnek MIPS komutu (Belleğe yazma)");
-                // Komut formatı: [opcode, addr_byte1, addr_byte2, addr_byte3, addr_byte4, val_byte1, ..., val_byte4]
-                if instruction_len >= 9 { // 1 opcode + 4 adres + 4 değer = 9 byte
-                    let address_bytes: [u8; 4] = instruction[1..5].try_into().map_err(|_| "Geçersiz komut formatı (adres)")?;
-                    let value_bytes: [u8; 4] = instruction[5..9].try_into().map_err(|_| "Geçersiz komut formatı (değer)")?;
-                    let address = u32::from_be_bytes(address_bytes) as usize; // VM adres alanı içindeki adres
-                    let value = u32::from_be_bytes(value_bytes); // Yazılacak değer
-
-                    // VM belleği slice'ı içinde adrese yazma
-                    // MIPS kelime hizalama ister, bu örnekte basit byte yazma yapalım veya hizalamayı kontrol edelim.
-                    // Basit byte yazma örneği:
-                     if address < vm_memory.len() {
-                          // İstenen adrese değeri yaz (basitçe ilk byte'ı yazalım veya tam kelime yazalım)
-                          // Tam kelime yazma (big-endian varsayımla):
-                          if address + 4 <= vm_memory.len() { // Bounds check for writing a word
-                               let value_bytes = value.to_be_bytes(); // MIPS genellikle big-endian
-                               vm_memory[address..address+4].copy_from_slice(&value_bytes);
-                               println!("  - Belleğe yazıldı: VM Adres=0x{:X}, Değer=0x{:X}", address, value);
-                          } else {
-                               eprintln!("  - Hata: Bellek sınırları dışında yazma (kelime): 0x{:X}", address);
-                               return Err("Bellek sınırları dışında yazma");
-                          }
-                     } else {
-                          eprintln!("  - Hata: Geçersiz VM bellek adresi: 0x{:X}", address);
-                          return Err("Geçersiz bellek adresi");
-                     }
-
-                } else {
-                    // PC'yi geri al? Veya hata durumunda PC'nin ne olacağı VM'in istisna/hata modeline bağlı.
-                     // Burada basitçe PC'yi güncelledik ve hatayı döndürüyoruz.
-                    return Err("Yetersiz komut uzunluğu (belleğe yazma)");
-                }
-            },
-            // Örnek MIPS komutu: Standart çıktıya yazma
-            // Opcode 0x02, sonra yazılacak stringin VM bellek adresi (4 byte)
-             // ve belki uzunluğu veya null terminator bilgisi
-            0x02 => {
-                println!("  - Opcode 0x02: Örnek MIPS komutu (Standart çıktıya yazma)");
-                // Komut formatı: [opcode, addr_byte1, ..., addr_byte4] (null-terminated string varsayalım)
-                if instruction_len >= 5 { // 1 opcode + 4 adres = 5 byte
-                     let address_bytes: [u8; 4] = instruction[1..5].try_into().map_err(|_| "Geçersiz komut formatı (adres)")?;
-                     let string_address = u32::from_be_bytes(address_bytes) as usize; // VM adres alanı içindeki string adresi
-
-                     if string_address < vm_memory.len() {
-                          let mut current_address = string_address;
-                          let mut printed_string_bytes: Vec<u8> = Vec::new();
-
-                          // VM belleğinden null terminator görene kadar oku
-                          while current_address < vm_memory.len() {
-                              let byte = vm_memory[current_address];
-                              if byte == 0 { // Null-terminated string
-                                  break;
-                              }
-                              printed_string_bytes.push(byte);
-                              current_address += 1;
-                          }
-
-                          // Okunan byte'ları string'e çevirip StandardLibrary'ye pass et
-                          match core::str::from_utf8(&printed_string_bytes) {
-                              Ok(s) => {
-                                  // StandardLibrary'nin print_string'i Sahne64 resource::write kullanıyor olmalı
-                                  self.standard_library.print_string(s);
-                              },
-                              Err(_) => {
-                                  eprintln!("  - Hata: VM belleğinde geçersiz UTF-8 string (VM Adresi 0x{:X}).", string_address);
-                                  // VM içinde bu bir istisna yaratabilir.
-                                  return Err("Geçersiz UTF-8 string");
-                              }
-                          }
-                     } else {
-                          eprintln!("  - Hata: Geçersiz VM bellek adresi (string): 0x{:X}", string_address);
-                          return Err("Geçersiz bellek adresi (string)");
-                     }
-                } else {
-                     return Err("Yetersiz komut uzunluğu (çıktı)");
-                }
-            },
-            // ... diğer opcode durumları ...
-            // Örnek VM System Call komutu (örneğin, SYSCALL opcode'u 0x0C olsun)
-            0x0C => {
-                 println!("  - Opcode 0x0C: Örnek MIPS Syscall komutu");
-                 // Gerçek MIPS'de syscall numarası ve argümanlar registerlarda olur.
-                 // Burada komutun kalanının syscall numarasını ve argümanları
-                 // temsil ettiğini varsayalım (basit örnek)
-                 if instruction_len >= 2 { // En az opcode + syscall_num
-                     let syscall_number = instruction[1] as u62; // Örnek syscall numarasını al
-                     // Argümanları al (registerlardan veya komut operandlarından)
-                      let arg1 = self.registers[a0]; // MIPS a0 registerı gibi
-                     // ...
-
-                     // VM içinden gelen bu syscall'u işleyen bir fonksiyon çağır.
-                     // Bu fonksiyon Sahne64 API'sını kullanacaktır.
-                     // Bu fonksiyonun imzası ve dönüş değeri VM'in syscall modeline bağlıdır.
-                     // Örnek: self.handle_vm_syscall(syscall_number, &args)?;
-
-                     // Basitlik için sadece syscall alındığını yazdıralım.
-                     println!("  - VM Syscall yakalandı: {}", syscall_number);
-
-                     // Eğer syscall başarılı olursa veya hata dönerse, VM'in durumunu (registerları) güncelle.
-                     // Örneğin, v0 registerına dönüş değerini, a3 registerına hata bayrağını yaz.
-                      self.registers[v0] = result_value;
-                      self.registers[a3] = error_flag;
-
-                 } else {
-                     return Err("Yetersiz komut uzunluğu (syscall)");
-                 }
-
-            }
-            _ => {
-                println!("  - Bilinmeyen Opcode: 0x{:X} (PC: 0x{:X})", opcode, current_pc);
-                // Bilinmeyen komut hatasını işle... VM task'ını sonlandırmak gibi.
-                return Err("Bilinmeyen opcode");
-            },
+        if end > data.len() {
+            return Err(LinkerError::ObjectParse(ObjectParseError::InvalidOffset(
+                String::from_format_args!("String okuma hatası: {} adresinden başlayan null-terminated string bulunamadı.", offset)
+            )));
         }
-
-        Ok(()) // Komut başarıyla yürütüldü (şimdilik basitleştirilmiş)
+        let slice = &data[offset..end];
+        String::from_utf8(slice.to_vec())
+            .map_err(|_| LinkerError::ObjectParse(ObjectParseError::InvalidUtf8(
+                String::from_format_args!("Geçersiz UTF-8 string: {:?}", slice)
+            )))
     }
-
-    // handle_vm_syscall gibi fonksiyonlar buraya eklenebilir.
-    // Bu fonksiyonlar VM içinden gelen syscall'ları alıp Sahne64 API'sına çevirir.
-     fn handle_vm_syscall(&mut self, syscall_num: u64, args: &[u64]) -> Result<(), SahneError> {
-         match syscall_num {
-    //         // Örnek: VM içinden gelen belleği serbest bırakma syscall'u
-             VM_SYSCALL_FREE => {
-                  let vm_addr_to_free = args[0];
-                  let size_to_free = args[1] as usize;
-    //              // VM adresini host pointer'a çevir (bu karmaşık olabilir, MMU simülasyonu gerektirebilir)
-    //              // Basitlik için VM adresinin offset olduğunu varsayalım:
-                  let host_ptr = self.vm_memory_ptr.add(vm_addr_to_free as usize);
-                  sahne_memory::release(host_ptr, size_to_free)?;
-             }
-    //         // Örnek: VM içinden dosya okuma syscall'u
-             VM_SYSCALL_READ => {
-                 let vm_fd = args[0]; // VM'in dosya tanımlayıcısı
-                 let vm_buffer_addr = args[1] as usize; // VM belleğindeki buffer adresi
-                 let size = args[2] as usize;
-    //
-    //             // VM FD'sini Sahne64 Handle'ına çevir (VM runner'ın takip etmesi lazım)
-                 let sahne64_handle: Handle = self.map_vm_fd_to_sahne_handle(vm_fd)?;
-    //
-    //             // VM belleğindeki buffer'a erişmek için slice al
-                 if vm_buffer_addr + size > self.vm_memory_size {
-                      return Err(SahneError::InvalidAddress); // Veya VM'e özel hata
-                 }
-                 let vm_buffer_slice = &mut self.get_memory_slice()[vm_buffer_addr .. vm_buffer_addr + size];
-    //
-    //             // Sahne64 resource::read çağrısı yap
-                 let bytes_read = resource::read(sahne64_handle, vm_buffer_slice)?;
-    //
-    //             // VM'e dönüş değerini (okunan byte sayısı) ve hata kodunu (varsa) bildir
-                  self.registers[v0] = bytes_read as u64;
-                  self.registers[a3] = 0; // Başarı
-             }
-    //         // ... diğer syscall'lar ...
-             _ => {
-                 eprintln!("Bilinmeyen VM syscall: {}", syscall_num);
-                 return Err(SahneError::NotSupported); // Veya VM'e özel hata
-             }
-         }
-         Ok(())
-     }
-
-
-    // Diğer MIPS mimarisine özgü fonksiyonlar buraya eklenebilir...
-    // Örneğin, register yönetimi, istisna işleme vb.
 }
